@@ -1,11 +1,11 @@
 from fuse import FUSE, FuseOSError, Operations
-from pathlib import Path
 import chdimage
 import errno
+import fnmatch
 import logging
 import os
-import sys
 import re
+import sys
 
 class CHDFS(Operations):
     @property
@@ -22,7 +22,9 @@ class CHDFS(Operations):
 
     def __init__(self, root):
 
-        basename = Path(root).stem
+        head, tail = os.path.split(root)
+        basename, ext = os.path.splitext(tail)
+        #logging.basicConfig(level=logging.DEBUG)
         self.chd = chdimage.open(root)
         self.tracks = {}
         self.cue_sheet = ''
@@ -47,62 +49,71 @@ class CHDFS(Operations):
                 'attr': self.default_file_attrs | {'st_size': size},
                 }
         self.cue_sheet = self.cue_sheet.encode() # serve per leggerlo come file
-        print(self.tracks)
+        logging.info(self.tracks)
 
     def getattr(self, path, fh=None):
-        print(f'getattr: {path} - {fh}')
+        logging.info(f'getattr: {path} - {fh}')
 
-        if self.cue_sheet_file_name == Path(path).name:
-            return self.default_file_attrs | {'st_size': len(self.cue_sheet)}
-        elif track := self.tracks.get(Path(path).name):
-            return track['attr']
-        else:
-            return {
-                'st_atime': 0,
-                'st_ctime': 0,
-                'st_mtime': 0,
-                'st_mode': 0o40555,
-                'st_nlink': 1,
-                'st_size': 4096,
-                'st_uid': 0,
-                'st_gid': 0,
-                }
+        head, tail = os.path.split(path)
+        if head == '/':
+            if self.cue_sheet_file_name == tail:
+                return self.default_file_attrs | {'st_size': len(self.cue_sheet)}
+            elif track := self.tracks.get(tail):
+                return track['attr']
+            else:
+                return {
+                    'st_atime': 0,
+                    'st_ctime': 0,
+                    'st_mtime': 0,
+                    'st_mode': 0o40555,
+                    'st_nlink': 1,
+                    'st_size': 4096,
+                    'st_uid': 0,
+                    'st_gid': 0,
+                    }
 
-    def readdir(self, path, fh): # dumb as shit, it return always all content
-        print(f'readdir: {path} - {fh}')
-        for r in self.tracks.keys():
-            yield r
-        for r in ['.', '..', self.cue_sheet_file_name]:
-            yield r
+    def readdir(self, path, fh):
+        logging.info(f'readdir: {path} - {fh}')
+
+        head, tail = os.path.split(path)
+        if head == '/':
+            for r in list(self.tracks.keys()) + ['.', '..', self.cue_sheet_file_name]:
+                if tail == '' or fnmatch.fnmatch(r, tail):
+                    yield r
 
     def open(self, path, flags):
-        print(f'open: {path} - {flags}')
-        if self.tracks.get(Path(path).name) is not None:
-            if flags & 0o100000:
-                return 0
+        logging.info(f'open: {path} - {flags}')
+
+        head, tail = os.path.split(path)
+        if head == '/':
+            if self.tracks.get(tail) is not None:
+                if flags & 0o100000:
+                    return 0
+                else:
+                    return -errno.EACCES
             else:
-                return -errno.EACCES
-        else:
-            return -errno.ENOENT
+                return -errno.ENOENT
 
     def read(self, path, size, offset, fh):
-        print(f'read: {path} - {size} - {offset} - {fh}')
+        logging.info(f'read: {path} - {size} - {offset} - {fh}')
 
-        if self.cue_sheet_file_name == Path(path).name:
-            return self.cue_sheet[offset:offset+size]
-        elif track := self.tracks.get(Path(path).name):
-            self.chd.set_location(chdimage.MsfIndex.from_lba(track['lba'] + int(offset / 2352)))
-            seek = offset % 2352
-            buffer = self.chd.copy_current_sector()[seek:]
-            event = self.chd.advance_position()
-
-            while len(buffer) < size and event != chdimage.Event.TRACKCHANGE and event != chdimage.Event.ENDOFDISC:
-                buffer += self.chd.copy_current_sector()
+        head, tail = os.path.split(path)
+        if head == '/':
+            if self.cue_sheet_file_name == tail:
+                return self.cue_sheet[offset:offset+size]
+            elif track := self.tracks.get(tail):
+                self.chd.set_location(chdimage.MsfIndex.from_lba(track['lba'] + int(offset / 2352)))
+                seek = offset % 2352
+                buffer = self.chd.copy_current_sector()[seek:]
                 event = self.chd.advance_position()
 
-            return buffer[:size]
-        else:
-            return -errno.ENOENT
+                while len(buffer) < size and event != chdimage.Event.TRACKCHANGE and event != chdimage.Event.ENDOFDISC:
+                    buffer += self.chd.copy_current_sector()
+                    event = self.chd.advance_position()
+
+                return buffer[:size]
+            else:
+                return -errno.ENOENT
 
 def main(mountpoint, root):
     FUSE(CHDFS(root), mountpoint, nothreads=True, foreground=True)
